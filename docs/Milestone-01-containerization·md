@@ -1,0 +1,125 @@
+# Milestone 01 — From Broken Code to Healthy Containers
+
+**Scope:** Stages 1–3 of the production-readiness project
+(System Understanding → Debugging & Fixes → Containerization)
+
+**Status at this milestone:** All four services (frontend, api, worker, redis) running as containers on a shared Docker network, all reporting `(healthy)`, with a job successfully flowing end-to-end: browser → frontend → API → Redis queue → worker → Redis status → API → browser.
+
+---
+
+## 1. What the system is
+
+A job-processing pipeline of four services:
+
+| Service  | Tech            | Role                                            | Listens on |
+|----------|-----------------|--------------------------------------------------|------------|
+| frontend | Node.js/Express | Serves the UI, forwards requests to the API      | 3000       |
+| api      | Python/FastAPI  | Creates jobs, writes status, answers status queries | 8000    |
+| redis    | Redis 7         | Job queue (list) + status board (hashes)         | 6379       |
+| worker   | Python          | Pulls jobs from the queue, processes, marks complete | — (no port) |
+
+Key architectural fact: the API and worker never talk to each other directly — only through Redis. This decoupling is what allows scaling workers independently later.
+
+Core data-flow rule learned: **a port belongs to the one who listens.** Outgoing connections need no port declaration. The worker exposes nothing because nobody ever connects *to* it.
+
+---
+
+## 2. Stage 1–2: Understanding and fixing the code
+
+Fifteen issues were found and fixed — full detail in [FIXES.md](./FIXES.md). The highlights that shaped everything after:
+
+- **Hardcoded `localhost` everywhere** (api, worker, frontend). Works on one machine; guaranteed failure in containers, where each container is its own host. Fixed with environment variables + sensible localhost fallbacks (`os.getenv("REDIS_HOST", "localhost")`), which later allowed the same code to run both locally and in Docker without changes.
+- **Race condition in job creation.** The API pushed the job to the queue *before* writing its "queued" status. A fast worker could complete the job and write "completed", which the API then overwrote with "queued" — a job finished in reality but stuck as "queued" forever. Fix: swap the two lines. Principle: *make work visible to consumers only after its metadata is fully written.* Lesson attached: a `sleep` is never a safety mechanism; correctness must not depend on timing.
+- **Silent failures.** The worker died permanently on any Redis error; the frontend swallowed real error details behind a generic "something went wrong". Fixed with retry loops (worker), honest status codes and operator logging (frontend, api). This paid off visibly later: during the containerization phase, the *broken* system loudly reported exactly what was wrong instead of dying quietly.
+- **No graceful shutdown.** The worker ignored SIGTERM, meaning every deploy could kill it mid-job — and since jobs are popped from the queue before processing, the job would be lost forever. Fixed with signal handlers that finish the current job before exiting.
+- **Secret committed to git.** `api/.env` with a Redis password was in the repository (and the code never even read it — Redis ran with no password). File removed from tracking, `.gitignore` added, password treated as burned.
+- **Unpinned dependencies** (found independently during review): bare package names in `requirements.txt` and caret ranges with no committed `package-lock.json` in the frontend. Fixed by pinning exact versions discovered via real installs (`pip freeze`) and committing the lockfile, with `npm ci` as the install command in builds.
+
+## 3. Local baseline run
+
+Before containerizing, the whole system was run directly on the host (four terminals: dockerized Redis, uvicorn for the API, python for the worker, node for the frontend). Purpose: establish a **baseline** — if it works locally and then breaks in Docker, the fault is in the Docker layer, not the code. It worked, including the full curl round-trip (job submitted → "queued" → "completed").
+
+### Errors encountered in this phase
+
+**`docker pull` failure: `tls: bad record MAC`**
+- What it looked like: image layers downloading, then a hard failure.
+- Root cause: corrupted data mid-download (flaky network / WSL2 quirk), not a configuration error.
+- Fix: retry. Docker caches completed layers, so the retry is fast.
+- Lesson: not every error is your fault; learn to recognize transient infrastructure noise.
+
+**`pip install` failure: `externally-managed-environment`**
+- Root cause: modern Ubuntu protects its system Python (the OS itself depends on it) and refuses direct pip installs.
+- Fix: per-project virtual environments (`python3 -m venv .venv && source .venv/bin/activate`).
+- Deliberately rejected: `--break-system-packages` (the flag says "break" in its name) and `sudo apt install uvicorn` (stale, system-wide).
+- Lesson: when a tool blocks you and offers a proper path, take the proper path. Bonus insight: the pain of maintaining separate venvs per service is exactly the problem containers solve.
+
+---
+
+## 4. Stage 3: Containerization
+
+### Design decisions per Dockerfile
+
+**api/Dockerfile — multi-stage, non-root, HTTP healthcheck**
+- Multi-stage: builder stage creates a venv and pip-installs; runtime stage copies only the finished venv. Rationale: throw away pip caches and build leftovers — ship the meal, not the kitchen.
+- `python:3.12-slim` base: smaller surface, fewer preinstalled programs to exploit.
+- Layer-cache ordering: `COPY requirements.txt` (changes rarely) before `COPY main.py` (changes often), so dependency installation stays cached across code edits. Rule: order layers least-changing → most-changing.
+- Non-root: `useradd appuser` + `USER appuser`. Least privilege — an exploited app should not be root.
+- `--host 0.0.0.0`: uvicorn's localhost default would accept connections only from inside the container itself; 0.0.0.0 accepts connections from other containers.
+- `HEALTHCHECK` calls `GET /health` (a new endpoint added to the API) every 10s.
+
+**worker/Dockerfile — the interesting one**
+- No `EXPOSE` (nothing ever connects to the worker) and plain `CMD ["python", "worker.py"]` (the worker is its own engine — an infinite loop — unlike FastAPI code, which only defines handlers and needs uvicorn to host it).
+- Healthcheck problem: how do you check the pulse of a process with no port? Docker already detects *death* (process exit) for free; the healthcheck's real target is the **alive-but-stuck zombie**.
+- Solution: heartbeat file. The worker touches `/tmp/heartbeat` on every loop iteration; the healthcheck asserts the file was modified within the last 15 seconds. `brpop(timeout=5)` guarantees the loop turns at least every ~5s even with no jobs, so a stale file reliably means a stuck process.
+- Lesson: logs are for humans; healthchecks are for machines — a healthcheck must be a command returning exit 0/1, not prose to interpret.
+
+**frontend/Dockerfile — single-stage, deliberately**
+- Analysis: multi-stage exists to *throw away build mess*. This frontend's only "build" is `npm ci --omit=dev`, whose entire output (`node_modules`) is needed at runtime. Nothing to discard → a second stage adds complexity for zero benefit.
+- Lesson: patterns are answers to problems, not rituals. Apply the problem test ("does the build create waste?"), not the pattern by reflex. A compiled frontend (React/TS) would flip this answer.
+- `node:20-slim` ships a ready `node` user (no useradd needed). Healthcheck uses `node -e` with an HTTP self-request, since curl doesn't exist in slim images.
+
+### Errors encountered in this phase
+
+**All services up, system dead: `Error 111 connecting to localhost:6379`**
+- Predicted in advance, then observed. With no env vars passed to `docker run`, the code's localhost fallbacks fired; inside a container, localhost is the container itself.
+- Observed silver lining: the system failed *loudly and honestly* — the worker retried every 3s with a precise error; the frontend returned `{"error":"api unavailable"}`. The Stage 2 fixes proved themselves during a failure.
+- Fix: shared user-defined network + name-based discovery: `docker network create appnet`, then `-e REDIS_HOST=redis`, `-e API_URL=http://api:8000`. Docker's internal DNS resolves container names to addresses.
+
+**API `(unhealthy)`: healthcheck 404**
+- Diagnosis from `docker logs api`: hundreds of `GET /health → 404 Not Found`. The `/health` endpoint had not actually been added to main.py.
+- Fix: add the endpoint, rebuild, replace.
+
+**Worker `(unhealthy)`: heartbeat file missing**
+- Same class of error: the heartbeat `touch` lines weren't in worker.py yet, so the file never existed and the check could never pass.
+- Core cycle burned in by this fix: **edit code → rebuild image → replace container.** Images are frozen; editing source files changes nothing inside running containers.
+
+**Misread error: "No such container: redis"**
+- Initially interpreted as "Redis failed to start". Actually produced by the *cleanup* command (`docker rm -f redis ...`) complaining that there was no old container to delete — while every subsequent command succeeded (five ID strings = network + four containers).
+- Lesson: match each error to the command that produced it before concluding anything.
+
+### Verification
+
+- `docker ps`: all four containers `(healthy)`.
+- Full round-trip via curl through the frontend returned a job id.
+- Operational note: api and worker were rebuilt and replaced while frontend and redis kept running untouched (CREATED column: minutes vs hours) — independent deployability demonstrated in practice, the concrete payoff of one-image-per-service.
+
+---
+
+## 5. Concepts locked in at this milestone
+
+- Image vs container vs Dockerfile; layers and cache ordering
+- Multi-stage builds: purpose is discarding build waste — use only when there is waste
+- Non-root execution and least privilege
+- EXPOSE semantics: declared by the listener, about the listener; outgoing needs nothing
+- localhost inside a container = the container itself; service discovery by container name on a shared network
+- Healthchecks as machine-readable verdicts (exit codes); heartbeat-file pattern for portless workers
+- Zombie state (alive but stuck) vs death; Docker detects death, healthchecks detect zombies
+- Baseline-first debugging: prove it works locally before adding the container variable
+- Loud failure as a feature: retry loops, honest status codes, operator logs
+- edit → rebuild → replace: the only way changes reach containers
+
+## 6. Next (Stage 4+)
+
+- Replace the hand-typed `docker run` sequence with a declarative `docker-compose.yml`: shared network, no external Redis exposure, env-driven config, health-based startup ordering (`depends_on.condition: service_healthy`), CPU/memory limits
+- `.env` (ignored) + `.env.example` (committed) — closing the secrets loop with a real Redis password via `--requirepass`
+- Then: reliability drills, CI/CD pipeline, rolling deployment, final documentation
