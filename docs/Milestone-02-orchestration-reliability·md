@@ -1,0 +1,94 @@
+# Milestone 02 — Orchestration & Reliability
+
+**Scope:** Stages 4–5 of the production-readiness project
+(Docker Compose orchestration → Reliability & failure handling)
+
+**Status at this milestone:** The entire four-service stack starts with a single command (`docker compose up -d --build`), self-orders its startup via health-gated dependencies, runs Redis password-protected and unreachable from outside, enforces CPU/memory limits per service, survives dependency outages with graceful degradation, and self-heals from process crashes via restart policies. Verified through deliberate chaos drills.
+
+---
+
+## 1. What was built
+
+### docker-compose.yml
+One declarative file replacing the hand-typed `docker network create` + four `docker run` commands from Milestone 01. Key design points:
+
+- **Named services = network addresses.** Compose runs internal DNS on the shared `appnet` bridge network; `REDIS_HOST: redis` resolves to the redis container. Names survive container replacement; IPs don't.
+- **Redis hardened.** `--requirepass "${REDIS_PASSWORD}"` finally enforces the password the original repo pretended to have (FIXES.md #3 closed in reality). Redis has **no `ports:` mapping** — reachable only from inside the network. The frontend's `3000:3000` is the single deliberate door into the system.
+- **Health-gated startup order.** `depends_on` with `condition: service_healthy` — not bare `depends_on`, which only orders *starting*, not *readiness*. The Stage 3 healthchecks became load-bearing: redis healthy → api and worker start (in parallel); api healthy → frontend starts.
+- **Resource limits** (`deploy.resources.limits`: 0.5 CPU / 256M per service). A leaking service gets throttled or killed alone instead of starving the whole machine — failure isolation at the resource level.
+- **Config via `.env`.** Compose auto-reads `.env` beside the yml. Real secret generated with `openssl rand -hex 16`, git-ignored; committed `.env.example` documents required variables with placeholders.
+
+### .env.example scoping decision
+Rule adopted: the example file documents **exactly the variables the deployment reads from the environment** — currently only `REDIS_PASSWORD`. `REDIS_HOST` was deliberately excluded: in this topology it equals the compose service name (structural, not environmental). If Redis ever moves to a managed cloud instance, the host becomes environment-varying and joins the file. The file mirrors the architecture.
+
+### Restart policies
+`restart: unless-stopped` on all four services. Flavor comparison that drove the choice:
+- `no` (default): crashes stay dead — observed live before the fix.
+- `on-failure[:N]`: restarts only on non-zero exit, optional cap.
+- `always`: resurrects even human-stopped containers after daemon restart — fights the operator.
+- `unless-stopped`: restarts any death Docker didn't cause on the operator's orders; respects explicit stops. Encodes the sane contract: *fight crashes, respect humans.*
+
+---
+
+## 2. Verifications performed
+
+- **Startup order observed** in `compose up` output: redis Healthy 12.4s → worker 12.8s / api Healthy 32.8s → frontend 33.1s. Predicted from the dependency tree before running; matched.
+- **Redis auth proven both ways:** `redis-cli ping` without password → `NOAUTH Authentication required`; with password → `PONG`. Bonus lesson from redis-cli's own warning: passwords on command lines leak via shell history — even test tooling echoes the config-outside-code principle.
+- **End-to-end job round-trip** through the composed stack: submit → queued → completed.
+
+---
+
+## 3. Chaos drills and what they taught
+
+### Drill 1: dependency outage (`docker compose stop redis`)
+**Prediction:** api and worker would "fail" and go unhealthy.
+**Reality:** every service stayed up and *healthy*; only requests needing Redis failed (politely, 503 "queue temporarily unavailable"); on `start redis`, the worker's retry loop reconnected and the pipeline resumed with zero human intervention.
+
+**Concepts extracted:**
+- **Container failure ≠ service unhealthiness ≠ request failure.** The outage produced only the third.
+- **Health is exactly the healthcheck's verdict, nothing deeper.** The API's `/health` doesn't touch Redis; the worker's heartbeat keeps beating because its retry loop keeps looping. Both are *liveness* checks ("is my process alive?"), deliberately shallow — deep *readiness* checks ("can I do useful work, dependencies included?") would make every dependency outage cascade into restart churn that fixes nothing. Restarting the API does not heal Redis.
+- **Graceful degradation is the microservice payoff:** "I'm alive; the queue is temporarily unavailable" beats collapse.
+
+### Drill 2: crash simulation, take one (`docker compose kill worker`)
+- Worker exited; nothing restarted it (this was before restart policies — the gap the drill was designed to expose).
+- **Exit-code literacy gained:** `Exited (137)` = 128 + signal 9 (SIGKILL). 137 in the wild usually means the kernel OOM-killer. Exit codes state the manner of death.
+- **stop vs kill vs rm ladder corrected:** stop = polite SIGTERM (catchable — graceful shutdown runs); kill = instant SIGKILL (uncatchable, no cleanup); rm = remove the stopped container from the books. Kill does *not* destroy the container — `ps -a` showed it sitting there, restartable.
+- **Job-loss nuance:** queued jobs are parked, not lost — the returning worker drains the backlog. The true casualty of SIGKILL is a job already popped and mid-processing: gone, status stuck "queued" forever. Graceful shutdown cannot help (SIGKILL is uncatchable by design); only queue architecture (ack-after-processing) can — noted as future work.
+
+### Drill 3: crash simulation, take two — and a corrected mental model
+After adding `restart: unless-stopped`, `docker compose kill worker` **still did not trigger a restart** — contradicting what the mentor had taught.
+
+**Corrected model, proven by the terminal:** restart policies key off *who caused the death*, not how violent it was. Any stop **or kill issued through Docker itself** is recorded as operator intent and respected. The policy's real question: *"did this container die without Docker being the one who killed it?"*
+
+**Honest crash simulation:** kill the process behind Docker's back, from the host:
+`sudo kill -9 $(docker inspect -f '{{.State.Pid}}' <container>)`
+Docker sees an unexplained death → policy fires → worker resurrects. Verified working.
+
+**Restart fingerprint learned:** a policy restart restarts the *same container* — nothing is rebuilt. In `docker ps`: CREATED stays old (container's birthday), STATUS resets young (current run's age). A gap between them = "died and rose." Build cache is a build-time concept; restarts build nothing.
+
+**Meta-lesson:** when an experiment contradicts the model, suspect the model and check what the test actually measures — even (especially) when the model came from the mentor.
+
+### Supporting habits picked up along the way
+- `docker compose ps` hides stopped containers; `-a` shows them. "It disappeared" usually means "I filtered it out."
+- `docker inspect -f '{{.HostConfig.RestartPolicy.Name}}'` — verify configuration on the running object instead of assuming.
+- Rebuild vs recreate vs no-op: code (or Dockerfile) changed → `up -d --build`; compose config changed → `up -d` recreates affected containers; nothing changed → `up -d` is idempotent and does nothing.
+
+---
+
+## 4. Concepts locked in at this milestone
+
+- Declarative vs imperative operations: describe the end state, let the tool derive the steps
+- Service discovery by name via compose DNS; single-exposed-port topology
+- depends_on + service_healthy as startup choreography; healthchecks as load-bearing signals
+- Liveness vs readiness; why shallow checks are a deliberate choice
+- Graceful degradation; request failure vs service failure vs container failure
+- Signals: SIGTERM vs SIGKILL; exit code arithmetic (128 + signal)
+- Restart policy semantics: operator intent vs unexplained death; unless-stopped as the sane default
+- Resource limits as failure isolation
+- .env / .env.example discipline: document exactly what the environment must supply
+
+## 5. Next (Stage 6+)
+
+- CI pipeline in GitHub Actions: lint (flake8, eslint, hadolint) → test (pytest, mocked Redis, coverage artifact) → build (SHA + latest tags, local registry) → security (Trivy, fail on CRITICAL) → integration (full stack, real job) → deploy
+- Each stage gated with `needs:` — the pipeline-level reincarnation of health-gated startup
+- Then: rolling deployment with health-verified cutover, final documentation
