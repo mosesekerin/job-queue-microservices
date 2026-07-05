@@ -1,4 +1,4 @@
-from pathlib import Path 
+from pathlib import Path
 import redis
 import time
 import os
@@ -33,7 +33,7 @@ def process_job(job_id):
 
 print("Worker started, waiting for jobs...", flush=True)
 while running:
-    Path("/tmp/heartbeat").touch()   
+    Path("/tmp/heartbeat").touch()
     try:
         job = r.brpop("job", timeout=5)
         if job:
