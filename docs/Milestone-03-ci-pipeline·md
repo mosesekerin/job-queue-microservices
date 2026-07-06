@@ -1,0 +1,124 @@
+# Milestone 03 — The CI Pipeline: Six Gates and What They Taught
+
+**Scope:** Stage 6 of the production-readiness project — a GitHub Actions pipeline with the stages **lint → test → build → security → integration** (deploy follows in Milestone 04).
+
+**Status at this milestone:** Every push to `main` triggers a five-gate pipeline. Each gate runs on a fresh disposable Ubuntu runner and is chained with `needs:`, so any failure freezes everything downstream. All five gates are green.
+
+---
+
+## 1. The mental model that everything else hangs on
+
+### The robot inspector
+Before this stage, the developer was the quality system: remembering to lint, test, rebuild, and verify. CI replaces that memory with a robot that runs the full checklist on every push, identically, forever. Passing is never a permanent status — the gate re-examines the code *as it is now* on every push, which is the point.
+
+### Three machines
+Every tool in the project lives on exactly one of three machines:
+1. **The laptop** — development, editors, venvs, clutter.
+2. **The runner** — a fresh, blank, disposable Ubuntu server GitHub provides per job. The inspector's workbench: tools get installed onto it, checks run on it, then the whole machine is destroyed. Nothing on it ever ships.
+3. **The image** — the sealed product. Contains only what production needs at runtime.
+
+This split resolves the dev-vs-prod dependency question permanently: fastapi/express ship in the image; pytest/fakeredis/eslint live on workbenches only (`--save-dev` in Node, separate pip installs in CI for Python; `npm ci --omit=dev` keeps them out of the image).
+
+### The chain
+`needs:` between jobs is the same idea as `depends_on: condition: service_healthy` in Compose and health-gated startup before that: **never proceed on top of something unproven.** Third appearance of the same principle, one level higher each time.
+
+### Pipeline shape
+Lint judges the **text**, test judges the **logic**, build produces the **object**, security judges the **object's contents**, integration judges the **assembled machine**. Each gate sees what the previous gates cannot. This stopped being a slogan the day the security gate caught a critical vulnerability that lint, test, and build had all waved through.
+
+---
+
+## 2. Gate by gate: what was built and what went wrong
+
+### Gate 1 — Lint (flake8, eslint, hadolint)
+Linters read code without running it and judge its *form*: syntax, unused variables, style. "It runs" and "it's lint-clean" are different exams.
+
+**Failure #1 (first-ever run):** flake8 — `E302 expected 2 blank lines` and `W291 trailing whitespace`. Prediction had been "green, because everything works"; reality taught that lint checks form, not function. Fix led to adopting **formatters**: Black for Python, format-on-save + trim-trailing-whitespace in VS Code — automating away the entire category of cosmetic violations. Division of labor learned: *formatters fix the boring 90% automatically; linters guard the meaningful 10% (unused imports, undefined names) no tool can fix for you.*
+
+**Local-lint episode:** running flake8 locally produced thousands of violations — all from `worker/.venv/...`, i.e. other people's libraries inside the virtual environment. Fix: `--extend-exclude=.venv`. Lessons: CI never had this problem because `.venv` is git-ignored and never reaches the runner; and famous libraries "violate" our rules because lint rules are house rules, not universal law. Habit adopted: **run the same linter locally that CI runs** — a two-second local verdict beats a two-minute remote red X.
+
+**Failure #2 — the day the gate earned its keep:** after restructuring worker.py, flake8 flagged `F401 'pathlib.Path' imported but unused`. That "pedantic" complaint was smoke from a real fire: the heartbeat `touch` line had been lost in the restructure — without it the container's healthcheck could never pass and the worker would run permanently unhealthy. An unused import is usually the ghost of intended or deleted behavior; the linter caught a functional regression disguised as fluff.
+
+**Policy insight:** pipelines *can* be configured to continue past failures (`continue-on-error`), and some teams run lint advisory-only. Trade-off learned: warnings nobody must fix become warnings nobody fixes, until a real problem drowns in the pile. Professional middle ground: keep the gate hard, tune the *rules* (ignore specific codes deliberately) rather than softening enforcement.
+
+### Gate 2 — Test (pytest + fakeredis + coverage)
+Testing, in one sentence coined during this stage: *"we test whether every single thing the program claims to be able to do, it can do."*
+
+**Mocking:** unit tests must not need a real Redis. `fakeredis` is an in-memory imitation; because the code reaches Redis through one variable (`r`), tests simply repoint it (`main.r = fakeredis.FakeRedis()`). Three reasons a fake beats the real thing for unit tests: **speed** (no image pull, no startup), **simplicity** (no service, port, or setup anywhere it runs), and **isolation/fresh state** (each test gets a brand-new empty store — no leftover data between tests, no flaky "passes alone, fails together"). Reproducibility again, in its fourth costume. Honest limit recorded: imitations can lie, which is exactly why an integration stage with real Redis also exists — two nets, different holes.
+
+Five tests: /health answers; job creation returns an ID, writes status *and* queues the job (guarding the old race-condition contract); status is readable; missing job returns 404 (guarding FIXES.md #5 forever); worker's `process_job` marks completed (with `time.sleep` monkeypatched away — mocking applied to time itself).
+
+**Failure #3 — the 28-minute hang:** pytest froze at "collecting 0 items." Root cause: **importing a Python file runs it top to bottom**, and worker.py ended in an infinite loop — pytest was trapped inside it. Fix: the famous `if __name__ == "__main__":` guard — definitions at top level, *action* behind the guard; a file should be importable without side effects. Docker's CMD unchanged; `import worker` now returns instantly.
+
+**Coverage honesty:** the tool measures which lines tests actually executed. Two artifacts of note: the suite ran in 2.75s once fixed (vs 1711s hung — fast tests get run, slow tests get skipped); and worker coverage *dropped* from 84% to 55% after the fix, because during the hang the loop was genuinely executing and being counted. The number went down because the measurement became truthful. Uncovered lines are precisely the `except ConnectionError` paths — fakes never fail, so failure-handling code never runs under unit tests; the integration stage exercises reality.
+
+Coverage.xml is uploaded as a build **artifact** — evidence a job leaves behind after its machine is destroyed.
+
+### Gate 3 — Build (SHA + latest tags, in-pipeline registry)
+A **registry** is a warehouse for images (`docker push`/`pull`). The job runs a tiny disposable one (`registry:2`) as a **service container** at localhost:5000 — proving the exact build → tag → push → verify mechanics production uses, with the warehouse address as the only thing that changes later.
+
+**Tagging scheme:** every image gets two labels in one build — `${{ github.sha }}` (the commit's unique fingerprint: an unbreakable link between this image and the exact code that produced it; the thing you roll back to at 2am) and `latest` (a moving convenience sticker meaning "newest"). Ship and roll back by SHA; humans casually pull latest. Verification step curls the registry's catalog: trust, then verify.
+
+### Gate 4 — Security (Trivy, fail on CRITICAL)
+The danger careful coding cannot prevent: **known vulnerabilities (CVEs) in software you ship but didn't write** — the entire operating system's worth of packages riding inside every image.
+
+**Failure #4 — a new species:** `Unable to resolve action aquasecurity/trivy-action@0.28.0`. Trivy never ran; the failure was in the **pipeline's own definition** — a version tag recalled from memory that didn't exist. Lesson doubled: always identify *which layer* failed (this died before any code was touched), and verify versions against reality, never memory — the `pip freeze` rule extended to pipeline tooling.
+
+**Failure #5 — the gate fires on the unfixable:** API image flagged 2 CRITICALs in `perl-base` (shipped by the Debian base, never installed by us) with `Status: fix_deferred/affected` and **no fixed version anywhere on Earth**. A gate nobody can satisfy stops being a gate and becomes a wall people disable. Policy adopted (industry standard): `ignore-unfixed: true` — **block catastrophic holes that have a published fix (shipping those is your fault); report but don't block the ones with no fix (monitor, rebuild when patched).** The gate aligned with actionability.
+
+**Failure #6 — the gate fires correctly:** frontend image flagged 2 CRITICALs in `libgnutls30` (including an authentication bypass) with `Status: fixed` — a patched version existed and our image didn't have it. Root cause discovered by reading the scan headers: `python:3.12-slim` rides Debian 13, but `node:20-slim` still rides **Debian 12** — older base, older packages. Fix that teaches the durable habit: `RUN apt-get update && apt-get upgrade -y && rm -rf /var/lib/apt/lists/*` in every Dockerfile — base images are snapshots frozen at *their* build date; security fixes published afterwards only arrive if the build asks. Corollary: **images rot** — production teams rebuild on schedule, not only on commits. Applied to all three Dockerfiles; prediction verified that the API's verdict wouldn't change (perl remains unfixable and ignored).
+
+Throughout: every one of *our* pinned application dependencies — Python and Node alike — scanned clean. The vulnerabilities lived exclusively in inherited OS layers.
+
+### Gate 5 — Integration (the assembled machine)
+The docker-compose.yml is reused verbatim inside CI: the runner generates a throwaway `.env` (the real one is git-ignored and thus absent — the ignore working as designed), `docker compose up -d --build --wait` brings the stack cold, and a shell loop submits a real job through the real frontend and polls until the real worker marks it completed.
+
+Patterns embedded in the job:
+- `--wait` turns the Stage 3 healthchecks into a CI gate: a stack that never turns healthy fails the step.
+- **Poll with a deadline** (10 tries × 2s): wait like a real client, but never forever — the antidote to the pytest-hang class of bug.
+- `curl -sf`: HTTP errors fail immediately instead of feeding garbage downstream.
+- `if: failure()` dumps all container logs (postmortem evidence); `if: always()` tears down (clean workbench). Both are workhorse conditions in real pipelines.
+
+This is also the stage that would catch the Stage 2 race condition against a *real* racing worker — unit tests documented the contract; integration enforces it against reality.
+
+**Result: passed first try**, as predicted from the architecture (retry loops + health-gated ordering make cold start safe).
+
+---
+
+## 3. Cross-cutting lessons
+
+### A taxonomy of failure (six species observed)
+1. **Code-form failures** — lint findings (E302, W291, F401).
+2. **Code-logic failures** — what tests exist to catch.
+3. **Infrastructure noise** — transient (the earlier TLS download corruption); retry, don't soul-search.
+4. **Pipeline-definition failures** — the robot's own instructions broken (Trivy version); nothing of yours was ever examined.
+5. **Policy-tuning failures** — the gate functioning correctly on rules that needed adjusting (unfixable CRITICALs).
+6. **Legitimate catches** — the gate doing exactly its job (fixable gnutls CRITICALs; the lost heartbeat).
+Diagnosing *which layer* died — by reading where in the log the run stopped — precedes every fix.
+
+### Timing numbers are local measurements, not laws
+Healthcheck grace periods, sleeps, deadlines: all were measured on one machine and silently assumed universal. A deadline tuned on fast hardware can fail honest software on slow hardware ("broken in CI, fine locally"). Cousin of the Stage 2 lesson that sleep is not a lock.
+
+### Statelessness of runs
+Every pipeline run is a first try — the runner has no memory. The memory lives in git: fresh servers, evolving definition. What "passing on the first try" really asks is whether the definition was right as written.
+
+### The prediction ritual
+Before every run: commit to a prediction, then let reality grade it. Both mentor and student were wrong repeatedly (student predicted green on the first lint run; mentor bet on hadolint and misremembered a version tag). The value is not being right — it is forcing the mental model onto the table where reality can correct it.
+
+---
+
+## 4. Concepts locked in at this milestone
+
+- CI as automated QA; gates re-examine every push, no permanent passes
+- Three machines: laptop / runner / image; dev vs prod dependencies
+- Jobs parallel by default; `needs:` chains them; steps sequential within a job
+- Linters vs formatters; house rules vs universal law; hard gates with tuned rules
+- Mocking (fakeredis, monkeypatched time); unit vs integration; two nets, different holes
+- `if __name__ == "__main__"`; importable-without-side-effects
+- Coverage as a flashlight, not a grade; artifacts as evidence
+- Registries; SHA-vs-latest tagging; service containers in CI
+- CVEs; severity gating; ignore-unfixed policy; base-image rot and build-time patching
+- Poll-with-deadline; `if: failure()` / `if: always()`; log dumps as postmortem evidence
+- Failure-layer diagnosis before fixing
+
+## 5. Next (Milestone 04)
+Deploy: provision the minimum viable target (single EC2, Docker + compose), GitHub Secrets for SSH credentials, and a rolling-update script — start new, wait for health, cut over only if healthy, abort within 60 seconds otherwise. The "make things visible only when fully ready" principle from the Stage 2 race condition, at deployment scale.
