@@ -64,3 +64,29 @@ jobs:
         with:
           name: coverage-report
           path: coverage.xml
+
+  build:
+    runs-on: ubuntu-latest
+    needs: test
+    services:
+      registry:
+        image: registry:2
+        ports:
+          - 5000:5000
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build, tag, and push images
+        run: |
+          for svc in api worker frontend; do
+            docker build \
+              -t localhost:5000/microapp-$svc:${{ github.sha }} \
+              -t localhost:5000/microapp-$svc:latest \
+              ./$svc
+            docker push localhost:5000/microapp-$svc:${{ github.sha }}
+            docker push localhost:5000/microapp-$svc:latest
+          done
+
+      - name: Verify images exist in the registry
+        run: |
+          curl -s http://localhost:5000/v2/_catalog
