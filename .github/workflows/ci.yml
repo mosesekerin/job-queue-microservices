@@ -104,21 +104,21 @@ jobs:
           done
 
       - name: Scan api image
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@master
         with:
           image-ref: microapp-api:scan
           severity: CRITICAL
           exit-code: "1"
 
       - name: Scan worker image
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@master
         with:
           image-ref: microapp-worker:scan
           severity: CRITICAL
           exit-code: "1"
 
       - name: Scan frontend image
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@master
         with:
           image-ref: microapp-frontend:scan
           severity: CRITICAL
