@@ -31,18 +31,19 @@ def process_job(job_id):
     print(f"Done: {job_id}", flush=True)
 
 
-print("Worker started, waiting for jobs...", flush=True)
-while running:
-    Path("/tmp/heartbeat").touch()
-    try:
-        job = r.brpop("job", timeout=5)
-        if job:
-            _, job_id = job
-            process_job(job_id.decode())
-    except redis.exceptions.TimeoutError:
-        continue  # nothing in the queue this round — completely normal, wait again
-    except redis.exceptions.RedisError as e:
-        print(f"ERROR: Redis problem, retrying in 3s: {e}", flush=True)
-        time.sleep(3)
+def main():
+    print("Worker started, waiting for jobs...", flush=True)
+    while running:
+        try:
+            job = r.brpop("job", timeout=5)
+            if job:
+                _, job_id = job
+                process_job(job_id.decode())
+        except redis.exceptions.ConnectionError as e:
+            print(f"ERROR: Redis unavailable, retrying in 3s: {e}", flush=True)
+            time.sleep(3)
+    print("Worker stopped cleanly.", flush=True)
 
-print("Worker stopped cleanly.", flush=True)
+
+if __name__ == "__main__":
+    main()
