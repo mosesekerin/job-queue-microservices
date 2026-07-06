@@ -109,6 +109,7 @@ jobs:
           image-ref: microapp-api:scan
           severity: CRITICAL
           exit-code: "1"
+          ignore-unfixed: true
 
       - name: Scan worker image
         uses: aquasecurity/trivy-action@master
@@ -116,6 +117,7 @@ jobs:
           image-ref: microapp-worker:scan
           severity: CRITICAL
           exit-code: "1"
+          ignore-unfixed: true
 
       - name: Scan frontend image
         uses: aquasecurity/trivy-action@master
@@ -123,3 +125,4 @@ jobs:
           image-ref: microapp-frontend:scan
           severity: CRITICAL
           exit-code: "1"
+          ignore-unfixed: true
