@@ -34,6 +34,7 @@ def process_job(job_id):
 def main():
     print("Worker started, waiting for jobs...", flush=True)
     while running:
+        Path("/tmp/heartbeat").touch()
         try:
             job = r.brpop("job", timeout=5)
             if job:
