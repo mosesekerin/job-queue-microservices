@@ -1,6 +1,9 @@
 # ---------- Stage 1: the builder ----------
 FROM python:3.12-slim AS builder
 
+# Apply security patches published since the base image was built
+RUN apt-get update && apt-get upgrade -y && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
 RUN python -m venv /opt/venv
