@@ -176,4 +176,4 @@ jobs:
           chmod 600 deploy_key
           ssh -i deploy_key -o StrictHostKeyChecking=accept-new \
             ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }} \
-            "cd ~/micro-service-app && git pull origin main && ./deploy.sh"
+            "cd ~/micro-service-app/job-queue-microservices && git pull origin main && ./deploy.sh"
