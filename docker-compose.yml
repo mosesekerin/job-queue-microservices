@@ -18,6 +18,7 @@ services:
     restart: unless-stopped
 
   api:
+    image: microapp-api
     build: ./api
     environment:
       REDIS_HOST: redis
@@ -36,6 +37,7 @@ services:
     restart: unless-stopped
 
   worker:
+    image: microapp-worker
     build: ./worker
     environment:
       REDIS_HOST: redis
@@ -54,12 +56,13 @@ services:
     restart: unless-stopped
 
   frontend:
+    image: microapp-frontend
     build: ./frontend
     environment:
       API_URL: http://api:8000
       PORT: "3000"
     ports:
-      - "3000:3000"
+      - "${FRONTEND_PORT:-3000}:3000"
     depends_on:
       api:
         condition: service_healthy
@@ -75,3 +78,4 @@ services:
 networks:
   appnet:
     driver: bridge
+    name: appnet
