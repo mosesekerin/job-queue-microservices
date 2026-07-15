@@ -170,3 +170,20 @@ Each issue below lists the file, location, root cause, the fix, and why it matte
 - **Root cause:** No setup instructions, architecture description, or run guide exists.
 - **Fix:** Full README covering architecture, service interaction flow, setup from scratch, and how to run — delivered in the documentation stage.
 - **Why it matters:** Undocumented systems can only be operated by their author. Onboarding, incident response, and handover all depend on the README being real.
+
+## Found in production (post-deployment)
+
+### 16. Worker crash on Redis TimeoutError — exception net too narrow
+- **Location:** `worker/worker.py` — `except redis.exceptions.ConnectionError`
+- **Symptom:** On the production EC2 host, a transient socket timeout raised
+  `redis.exceptions.TimeoutError`, which is a sibling (not a child) of
+  `ConnectionError`. It escaped the retry net and killed the process. The
+  `restart: unless-stopped` policy resurrected the container (observed:
+  CREATED "about an hour ago", STATUS "Up 2 minutes").
+- **Fix:** Widen the net to the family parent: `except redis.exceptions.RedisError`.
+  Shipped via the first automated pipeline deployment.
+- **Why it matters:** Defense in depth demonstrated live — the inner layer
+  (exception handling) had a hole; the outer layer (restart policy) covered it.
+  This failure class was undetectable by unit tests (fakes never time out) and
+  by a 20-second integration test; only production traffic over hours surfaced
+  it. It is the standing argument for observability.
