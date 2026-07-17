@@ -9,11 +9,11 @@ along the way documented rather than hidden.
 Redis 7 · Docker & Compose · GitHub Actions · Terraform · AWS (EC2, EIP, IAM,
 SSM)
 
-```
- Browser ──► Frontend (:3000) ──► API (:8000) ──► Redis ◄── Worker
-                                         ▲    queue+status │
-                                         └───── status ────┘
-```
+<p align="center">
+  <img src="asset/Application_Delivery_Platform.png" alt="Architectural Image" width="100%">
+</p>
+
+
 
 Jobs are processed asynchronously: the API returns a job id instantly, a
 worker drains the Redis queue and marks completion, the browser polls status.
